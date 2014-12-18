@@ -7,6 +7,7 @@
 #define MOTOR_0        204
 #define MOTOR_100      408
 #define MOTOR_50       ((MOTOR_0+MOTOR_100)/2)
+#define MOTOR_25       ((MOTOR_0+MOTOR_50)/2)
 
 
 #define LED_1G    42
@@ -23,27 +24,59 @@
 
 #define GREEN_TOGGLE         30
 
-#define KNOB1         A8
-#define KNOB2         A9
-#define KNOB3         A10
-#define KNOB4         A11
+#define KNOB1         A11
+#define KNOB2         A10
+#define KNOB3         A9
+#define KNOB4         A8
 
 
-#define BELT_STEP             2
-#define BELT_DIRECTION        5
-#define BELT_ENCODER          A13
+#define BELT_WAIT               A8
+#define BELT_STEP               2
+#define BELT_DIRECTION          5
+#define BELT_ENCODER            A13
 
-#define STATION_SEAL_MOTOR    14
-#define STATION_SEAL_HALL     28
-#define STATION_SEAL_HEAT     22
-#define STATION_SEAL_TEMP     A12
+#define STATION_SEAL_MOTOR      14
+#define STATION_SEAL_HALL       28
+#define STATION_SEAL_HEAT       25
+#define STATION_SEAL_TEMP       A12
+#define STATION_SEAL_TEMP_SET   A10
+#define STATION_SEAL_TEMP_ERROR() (analogRead(STATION_SEAL_TEMP_SET) - analogRead(STATION_SEAL_TEMP))
 
-#define STATION_FILL_SERVO    13
-#define STATION_FILL_UP       300
-#define STATION_FILL_DOWN     135
+volatile enum {
+  SEAL_TURN_1,
+  SEAL_TURN_2,
+  SEAL_DONE,
+  SEAL_OFF,
+} seal_state = SEAL_OFF;
+
+
+#define STATION_FILL_SERVO      13
+#define STATION_FILL_SWITCH     27
+#define STATION_FILL_UP         300
+#define STATION_FILL_CHECK      200
+#define STATION_FILL_DOWN       135
+#define STATION_FILL_STEP       3
+#define STATION_FILL_DIRECTION  6
+
+volatile enum {
+  FILL_MOVE_1,
+  FILL_CHECK,
+  FILL_MOVE_2,
+  FILL_DONE,
+  FILL_OFF,
+} fill_state = FILL_DONE;
+
+
 
 #define STATION_CUT_MOTOR     15
 #define STATION_CUT_HALL      24
+
+volatile enum {
+  CUT_TURN_1,
+  CUT_TURN_2,
+  CUT_DONE,
+  CUT_OFF,
+} cut_state = CUT_OFF;
 
 
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
@@ -55,63 +88,69 @@ volatile unsigned seal_temperature = 0;
 
 volatile enum {
   INIT,
+  WAIT,
   MOVE_BELT,
-  DONE,
+  STATIONS,
   BELT_ERROR,
-} mode = INIT;
+} global_state = INIT;
+
+#define IS_ERROR()  (global_state == BELT_ERROR)
 
 
 
-void reset()
-{
-  //wdt_enable(WDTO_15MS);
-  //while(1);
+int debounceRead(int pin) {
+  unsigned value = digitalRead(pin);
+  unsigned last_debounce = millis();
+  
+  while ((millis() - last_debounce) < 50) {
+    delay(1);
+    int newvalue = digitalRead(pin);
+    if (newvalue != value) {
+      value = newvalue;
+      last_debounce = millis();
+    }
+  }
+  
+  return value;
 }
 
 void setup()
 {
   Serial.begin(9600);
   
-  // Set LEDs to out (active low)
-  pinMode(LED_1G, OUTPUT);
-  pinMode(LED_2A, OUTPUT);
-  pinMode(LED_3G, OUTPUT);
-  pinMode(LED_4R, OUTPUT);
-  pinMode(LED_5R, OUTPUT);
-  pinMode(LED_6R, OUTPUT);
+  // Initialize the user interface
+  {
+    // Set LEDs to out (active low)
+    pinMode(LED_1G, OUTPUT);
+    pinMode(LED_2A, OUTPUT);
+    pinMode(LED_3G, OUTPUT);
+    pinMode(LED_4R, OUTPUT);
+    pinMode(LED_5R, OUTPUT);
+    pinMode(LED_6R, OUTPUT);
+    
+    // Set up big green button
+    pinMode(GREEN_TOGGLE, INPUT_PULLUP);
+  }
+  
   LED_ALLON();
   
-  // Set CNC shield ENable (active low)
-  pinMode(8, OUTPUT);
-  digitalWrite(8, 0);
-  
-  // Set up big green button
-  pinMode(GREEN_TOGGLE, INPUT_PULLUP);
-  
-  // Set stepper pins
-  pinMode(BELT_STEP, OUTPUT);
-  pinMode(BELT_DIRECTION, OUTPUT);
-  digitalWrite(BELT_DIRECTION, 0);
-  
   // Init I2C PWM board to 50Hz
-  pwm.begin();
-  pwm.setPWMFreq(50);
-  
-  pwm.setPWM(STATION_CUT_MOTOR, 0, MOTOR_0);
-  pwm.setPWM(STATION_FILL_SERVO, 0, STATION_FILL_DOWN);
-  pwm.setPWM(STATION_SEAL_MOTOR, 0, MOTOR_0);
-
-  delay(3000);
-  LED_ALLOFF();
-  
-  // Wait for green button to depress
-  LED_ON(LED_2A);
-  while (digitalRead(GREEN_TOGGLE) == 0);
+  {
+    pwm.begin();
+    pwm.setPWMFreq(50);
+    
+    // Set PWM to OFF, wait a bit for register
+    pwm.setPWM(STATION_CUT_MOTOR, 0, MOTOR_0);
+    pwm.setPWM(STATION_FILL_SERVO, 0, STATION_FILL_DOWN);
+    pwm.setPWM(STATION_SEAL_MOTOR, 0, MOTOR_0);
+    delay(1000);
+  }
   
   // Initialize the cutter
   {
     pinMode(STATION_CUT_HALL, INPUT_PULLUP);
     
+    // Home cutter motor
     pwm.setPWM(STATION_CUT_MOTOR, 0, MOTOR_50);
     while (digitalRead(STATION_CUT_HALL) == 0);
     while (digitalRead(STATION_CUT_HALL) == 1);
@@ -120,18 +159,28 @@ void setup()
   
   // Initialize the filler
   {
+    // Pump stepper
+    pinMode(STATION_FILL_STEP, OUTPUT);
+    pinMode(STATION_FILL_DIRECTION, OUTPUT);
+    digitalWrite(STATION_FILL_DIRECTION, 0);
+    
+    // Fill check switch
+    pinMode(STATION_FILL_SWITCH, INPUT_PULLUP);
+
+    // Put pump servo in upward position
     pwm.setPWM(STATION_FILL_SERVO, 0, STATION_FILL_UP);
     delay(250);
   }
   
   // Initialize sealer
   {
+    // Configure heater
     pinMode(STATION_SEAL_HALL, INPUT_PULLUP);
     pinMode(STATION_SEAL_HEAT, OUTPUT);
+    //digitalWrite(STATION_SEAL_HEAT, 1);
+    //seal_temperature = analogRead(STATION_SEAL_TEMP);
     
-    digitalWrite(STATION_SEAL_HEAT, HIGH);
-    seal_temperature = analogRead(STATION_SEAL_TEMP);M
-    
+    // Home sealer motor
     pwm.setPWM(STATION_SEAL_MOTOR, 0, MOTOR_50);
     while (digitalRead(STATION_SEAL_HALL) == 0);
     while (digitalRead(STATION_SEAL_HALL) == 1);
@@ -140,111 +189,189 @@ void setup()
   
   // Initialize belt
   {
-    // Get encoder value
+    // Belt stepper
+    pinMode(BELT_STEP, OUTPUT);
+    pinMode(BELT_DIRECTION, OUTPUT);
+    digitalWrite(BELT_DIRECTION, 0);
+    
+    // Get encoder value, set belt home position
     next_beltpos = analogRead(BELT_ENCODER);
     next_beltpos += fmod(next_beltpos, 102.4);
   }
   
+  // Initialize CNC shield
+  {
+    // Set CNC shield ENable (active low)
+    pinMode(8, OUTPUT);
+    digitalWrite(8, 0);
+  }
+
   // Configure stepper timer interrupt
   Timer1.initialize(300);
   Timer1.attachInterrupt(timerint);
   
+  // Wait for temperature
+  LED_ALLOFF(); LED_ON(LED_2A);
+  while ((analogRead(STATION_SEAL_TEMP_SET) - analogRead(STATION_SEAL_TEMP)) > 0) {
+    delay(100);
+  }
   
+  // Wait for green button to depress
+  LED_ALLOFF(); LED_ON(LED_3G);
+  while (debounceRead(GREEN_TOGGLE) == 0) {
+    delay(100);
+  }
   
-  LED_OFF(LED_2A);
-  mode = DONE;
+  global_state = WAIT;
 }
 
 void loop()
 {
-  while (digitalRead(GREEN_TOGGLE) == 1) {
-    LED_OFF(LED_1G); LED_ON(LED_3G);
+  // Check for errors
+  while (IS_ERROR() && debounceRead(GREEN_TOGGLE) == 0) {
+    delay(100);
   }
-  LED_OFF(LED_3G); LED_ON(LED_1G);
-  //step1_max = map(analogRead(KNOB1), 0, 1023, 2, 50);
-  //step2_max = map(analogRead(STEP2_KNOB), 0, 1023, 1, 100);
-  ///step1_max = 25;
-  //step1_max *= step1_max / 2;
-  //step2_max *= step2_max;
+  global_state = WAIT;
+
+
+handle_pause:
+
+  // Handle pause
+  LED_OFF(LED_1G);
+  while (debounceRead(GREEN_TOGGLE) == 1) {
+    LED_ON(LED_3G);
+    delay(100);
+  }
+  LED_OFF(LED_3G);
   
-  //int k1 = map(analogRead(STEP2_KNOB), 0, 1023, 204, 408);
-  //int k2 = map(analogRead(STEP3_KNOB), 0, 1023, 204, 408);
-  //int k3 = map(analogRead(STEP4_KNOB), 0, 1023, 204, 408);
+  // Handle heater
+  if (!IS_ERROR() && STATION_SEAL_TEMP_ERROR() > 20) {
+    while (!IS_ERROR() && STATION_SEAL_TEMP_ERROR() > 0) {
+      delay(100);
+    }
+    
+    LED_ON(LED_3G);
+    while (debounceRead(GREEN_TOGGLE) == 0) {
+      delay(100);
+    }
+    
+    goto handle_pause;
+  }
+  LED_ON(LED_1G);
   
-  //pwm.setPWM(13, 0, k1);
-  //pwm.setPWM(14, 0, k2);
-  //pwm.setPWM(15, 0, k3);
-  
-  //Serial.print("K1 = "); Serial.print(k1);
-  //Serial.print(", K2 = "); Serial.print(k2);
-  //Serial.print(", K3 = "); Serial.print(k3);
-  //Serial.println(".");
-  
-  //Serial.print("Encoder = "); Serial.print(analogRead(BELT_ENCODER)/10); Serial.println(".");
-  //Serial.print("GREEN_TOGGLE = "); Serial.print(digitalRead(GREEN_TOGGLE)); Serial.println(".");
-  //Serial.print("Knob1 = "); Serial.print(analogRead(KNOB1)); Serial.println(".");
-  //Serial.print("Knob2 = "); Serial.print(analogRead(KNOB2)); Serial.println(".");
-  //Serial.print("Knob3 = "); Serial.print(analogRead(KNOB3)); Serial.println(".");
-  //Serial.print("Knob4 = "); Serial.print(analogRead(KNOB4)); Serial.println(".");
-  //Serial.println(last_BELT_ENCODER);
-  //delay(10);
-  //delay(500);
-  
-  
-  if (mode == DONE) {
+  if (global_state == WAIT) {
+    double old_beltpos = next_beltpos;
+    
+    // Advance belt to next position
     next_beltpos = fmod(next_beltpos + 102.4, 1024);
     belt_watchdog = millis();
-    mode = MOVE_BELT;
+    global_state = MOVE_BELT;
     
-    while (mode == MOVE_BELT);
-    Serial.println(analogRead(BELT_ENCODER));
+    // Wait for state change
+    while (global_state == MOVE_BELT) {
+      delay(10);
+    }
+    
+    if (IS_ERROR()) {
+      // Revert old belt position on error
+      next_beltpos = old_beltpos;
+    }
   }
-  delay(1000);
   
-  /*
-  if (ledval == 0) {
-    ledval = 1;
+  if (global_state == STATIONS) {
+    // Cut station
+    pwm.setPWM(STATION_CUT_MOTOR, 0, MOTOR_100);
+    cut_state = CUT_TURN_1;
+    
+    // Fill station
+    //pwm.setPWM(STATION_FILL_SERVO, 0, STATION_FILL_DOWN);
+    fill_state = FILL_OFF; //FILL_MOVE_1;
+    
+    // Seal station
+    pwm.setPWM(STATION_SEAL_MOTOR, 0, MOTOR_25);
+    seal_state = SEAL_TURN_1;
+    
+    // Wait for state change
+    while (!IS_ERROR() && (cut_state != CUT_OFF || fill_state != FILL_OFF || seal_state != SEAL_OFF)) {
+      if (cut_state == CUT_DONE) {
+        pwm.setPWM(STATION_CUT_MOTOR, 0, MOTOR_0);
+        cut_state = CUT_OFF;
+      }
+      
+      if (fill_state == FILL_DONE) {
+        pwm.setPWM(STATION_FILL_SERVO, 0, STATION_FILL_UP);
+        fill_state = FILL_OFF;
+      }
+      
+      if (seal_state == SEAL_DONE) {
+        pwm.setPWM(STATION_SEAL_MOTOR, 0, MOTOR_0);
+        seal_state = SEAL_OFF;
+      }
+      
+      delay(1);
+    }
   }
   
-  Serial.print("LED = "); Serial.print(ledval); Serial.println(".");
-
-  digitalWrite(LED_1G, (ledval & (1 << 0)) ? 0 : 1);
-  digitalWrite(LED_2A, (ledval & (1 << 1)) ? 0 : 1);
-  digitalWrite(LED_3G, (ledval & (1 << 2)) ? 0 : 1);
-  digitalWrite(LED_4R, (ledval & (1 << 3)) ? 0 : 1);
-  digitalWrite(LED_5R, (ledval & (1 << 4)) ? 0 : 1);
-  digitalWrite(LED_6R, (ledval & (1 << 5)) ? 0 : 1);
-
-  ledval <<= 1;
-  
-  
-  
-  
-  delay(500);
-  */
+  // Handle knobbed pause
+  delay(500 + map(analogRead(BELT_WAIT), 0, 1023, 0, 5000));
 }
 
+volatile unsigned count = 0;
 void timerint()
 {
-  if (mode == MOVE_BELT || mode == INIT) {
+  if (global_state == MOVE_BELT || global_state == INIT) {
     if(fabs((double)analogRead(BELT_ENCODER) - next_beltpos) > 10.0) {
       digitalWrite(BELT_STEP, digitalRead(BELT_STEP) ^ 1);
     } else {
       // Next step
-      mode = DONE;
+      global_state = STATIONS;
     }
   }
   
-  /*
-  unsigned BELT_ENCODER = analogRead(BELT_ENCODER);
-  unsigned long last_BELT_ENCODER_wrapped = (last_BELT_ENCODER % 1024);
-  
-  if (BELT_ENCODER < last_BELT_ENCODER_wrapped) {
-    last_BELT_ENCODER += 1024 - last_BELT_ENCODER_wrapped + BELT_ENCODER;
-  } else {
-    last_BELT_ENCODER += BELT_ENCODER - last_BELT_ENCODER_wrapped;
+  if (global_state == STATIONS) {
+    // Check cutter station
+    if (cut_state == CUT_TURN_1 || cut_state == CUT_TURN_2) {
+      unsigned hall = digitalRead(STATION_CUT_HALL);
+      if (cut_state == CUT_TURN_1 && hall == 1) {
+        cut_state = CUT_TURN_2;
+      } else if (cut_state == CUT_TURN_2 && hall == 0) {
+        cut_state = CUT_DONE;
+      }
+    }
+    
+    // Check fill station
+    if (fill_state == FILL_MOVE_1) {
+      if (fill_state == FILL_MOVE_1 && digitalRead(STATION_FILL_SWITCH) == 0) {
+        fill_state = FILL_DONE;
+      }
+    }
+    
+    // Check seal station
+    if (seal_state == SEAL_TURN_1 || seal_state == SEAL_TURN_2) {
+      unsigned hall = digitalRead(STATION_SEAL_HALL);
+      if (seal_state == SEAL_TURN_1 && hall == 1) {
+        seal_state = SEAL_TURN_2;
+      } else if (seal_state == SEAL_TURN_2 && hall == 0) {
+        seal_state = SEAL_DONE;
+      }
+    }
   }
-  */
+  
+  if ((count % 1000) == 0) {
+    int err = STATION_SEAL_TEMP_ERROR();
+    
+    if(!IS_ERROR() && err > 0) {
+      digitalWrite(STATION_SEAL_HEAT, 0);
+    } else{
+      digitalWrite(STATION_SEAL_HEAT, 1);
+    }
+    
+    if (!IS_ERROR() && err > 20) {
+      LED_ON(LED_2A);
+    } else {
+      LED_OFF(LED_2A);
+    }
+  }
   
   /*
   if (++step2_val >= step2_max)
@@ -255,9 +382,11 @@ void timerint()
   */
   
   // Check watchdogs
-  if (mode == MOVE_BELT && (millis() - belt_watchdog) > 1000) {
-    //mode = BELT_ERROR;
+  if (global_state == MOVE_BELT && (millis() - belt_watchdog) > 1000) {
+    global_state = BELT_ERROR;
     LED_ERROR(LED_4R);
   }
+  
+  count += 1;
 }
 
