@@ -7,7 +7,9 @@
 #define MOTOR_0        204
 #define MOTOR_100      408
 #define MOTOR_50       ((MOTOR_0+MOTOR_100)/2)
-#define MOTOR_25       ((MOTOR_0+MOTOR_50)/2)
+//#define MOTOR_25       ((MOTOR_0+MOTOR_50)/2)
+//#define MOTOR_12       ((MOTOR_0+MOTOR_25)/2)
+
 
 
 #define LED_1G    42
@@ -35,7 +37,12 @@
 #define BELT_DIRECTION          5
 #define BELT_ENCODER            A13
 
+volatile double next_beltpos = 0;
+volatile unsigned long belt_watchdog = 0;
+
+
 #define STATION_SEAL_MOTOR      14
+#define STATION_SEAL_SPEED      A9
 #define STATION_SEAL_HALL       28
 #define STATION_SEAL_HEAT       25
 #define STATION_SEAL_TEMP       A12
@@ -44,28 +51,33 @@
 
 volatile enum {
   SEAL_TURN_1,
+  SEAL_SLOW_SPEED,
   SEAL_TURN_2,
   SEAL_DONE,
   SEAL_OFF,
 } seal_state = SEAL_OFF;
 
+volatile unsigned seal_temperature = 0;
+
 
 #define STATION_FILL_SERVO      13
 #define STATION_FILL_SWITCH     27
-#define STATION_FILL_UP         300
-#define STATION_FILL_CHECK      200
-#define STATION_FILL_DOWN       135
+#define STATION_FILL_UP         275
+#define STATION_FILL_CHECK      230
+#define STATION_FILL_DOWN       210
 #define STATION_FILL_STEP       3
 #define STATION_FILL_DIRECTION  6
 
 volatile enum {
-  FILL_MOVE_1,
-  FILL_CHECK,
-  FILL_MOVE_2,
+  FILL_RESET,
+  FILL_CHECK_1,
+  FILL_CHECK_2,
+  FILL_PUMP,
   FILL_DONE,
   FILL_OFF,
-} fill_state = FILL_DONE;
+} fill_state = FILL_OFF;
 
+volatile int fill_stepsleft = 0;
 
 
 #define STATION_CUT_MOTOR     15
@@ -79,12 +91,9 @@ volatile enum {
 } cut_state = CUT_OFF;
 
 
+
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
 
-volatile double next_beltpos = 0;
-volatile unsigned long belt_watchdog = 0;
-
-volatile unsigned seal_temperature = 0;
 
 volatile enum {
   INIT,
@@ -92,9 +101,10 @@ volatile enum {
   MOVE_BELT,
   STATIONS,
   BELT_ERROR,
+  FILL_ERROR,
 } global_state = INIT;
 
-#define IS_ERROR()  (global_state == BELT_ERROR)
+#define IS_ERROR()  (global_state == BELT_ERROR || global_state == FILL_ERROR)
 
 
 
@@ -141,7 +151,7 @@ void setup()
     
     // Set PWM to OFF, wait a bit for register
     pwm.setPWM(STATION_CUT_MOTOR, 0, MOTOR_0);
-    pwm.setPWM(STATION_FILL_SERVO, 0, STATION_FILL_DOWN);
+    pwm.setPWM(STATION_FILL_SERVO, 0, STATION_FILL_CHECK);
     pwm.setPWM(STATION_SEAL_MOTOR, 0, MOTOR_0);
     delay(1000);
   }
@@ -195,8 +205,9 @@ void setup()
     digitalWrite(BELT_DIRECTION, 0);
     
     // Get encoder value, set belt home position
+    //next_beltpos = 697.0;
     next_beltpos = analogRead(BELT_ENCODER);
-    next_beltpos += fmod(next_beltpos, 102.4);
+    next_beltpos += 102.4 - fmod(next_beltpos, 102.4);
   }
   
   // Initialize CNC shield
@@ -222,7 +233,7 @@ void setup()
     delay(100);
   }
   
-  global_state = WAIT;
+  //global_state = WAIT;
 }
 
 void loop()
@@ -231,20 +242,20 @@ void loop()
   while (IS_ERROR() && debounceRead(GREEN_TOGGLE) == 0) {
     delay(100);
   }
-  global_state = WAIT;
-
+  LED_OFF(LED_4R); LED_OFF(LED_5R); LED_OFF(LED_6R);
 
 handle_pause:
 
   // Handle pause
-  LED_OFF(LED_1G);
   while (debounceRead(GREEN_TOGGLE) == 1) {
-    LED_ON(LED_3G);
+    LED_OFF(LED_1G); LED_ON(LED_3G);
     delay(100);
   }
   LED_OFF(LED_3G);
+  global_state = WAIT;
   
   // Handle heater
+  LED_OFF(LED_1G);
   if (!IS_ERROR() && STATION_SEAL_TEMP_ERROR() > 20) {
     while (!IS_ERROR() && STATION_SEAL_TEMP_ERROR() > 0) {
       delay(100);
@@ -284,11 +295,13 @@ handle_pause:
     cut_state = CUT_TURN_1;
     
     // Fill station
-    //pwm.setPWM(STATION_FILL_SERVO, 0, STATION_FILL_DOWN);
-    fill_state = FILL_OFF; //FILL_MOVE_1;
+    unsigned fill_start = millis();
+    unsigned fill_tries = 0;
+    pwm.setPWM(STATION_FILL_SERVO, 0, STATION_FILL_CHECK);
+    fill_state = FILL_CHECK_1;
     
     // Seal station
-    pwm.setPWM(STATION_SEAL_MOTOR, 0, MOTOR_25);
+    pwm.setPWM(STATION_SEAL_MOTOR, 0, MOTOR_100);
     seal_state = SEAL_TURN_1;
     
     // Wait for state change
@@ -298,22 +311,70 @@ handle_pause:
         cut_state = CUT_OFF;
       }
       
-      if (fill_state == FILL_DONE) {
+      unsigned now = millis();
+      #define FILL_TIME()            (now - fill_start)
+      #define FILL_TRANS(state) { fill_start = millis(); fill_state = state; }
+      if (fill_state == FILL_RESET && FILL_TIME() > 500) {
+        
+        // 3 strikes and you're out
+        if (fill_tries >= 3) {
+          global_state = FILL_ERROR;
+          LED_ERROR(LED_5R);
+          break;
+        }
+        
+        pwm.setPWM(STATION_FILL_SERVO, 0, STATION_FILL_CHECK);
+        FILL_TRANS(FILL_CHECK_1);
+        
+      } else if (fill_state == FILL_CHECK_1 && FILL_TIME() > 500) {
+        
+        if (digitalRead(STATION_FILL_SWITCH) == 0) {
+          // Fill switch contacted something, bad
+          fill_tries += 1;
+          pwm.setPWM(STATION_FILL_SERVO, 0, STATION_FILL_UP);
+          FILL_TRANS(FILL_RESET);
+        } else {
+          // Fill switch good
+          pwm.setPWM(STATION_FILL_SERVO, 0, STATION_FILL_DOWN);
+          FILL_TRANS(FILL_CHECK_2);
+        }
+        
+      } else if (fill_state == FILL_CHECK_2 && FILL_TIME() > 500) {
+        
+        if (digitalRead(STATION_FILL_SWITCH) == 1) {
+          // Fill switch contacted nothing, empty
+          FILL_TRANS(FILL_DONE);
+        } else {
+          // Fill switch engaged
+          fill_stepsleft = 3000;
+          FILL_TRANS(FILL_PUMP);
+        }
+        
+      } else if (fill_state == FILL_DONE) {
         pwm.setPWM(STATION_FILL_SERVO, 0, STATION_FILL_UP);
         fill_state = FILL_OFF;
       }
       
-      if (seal_state == SEAL_DONE) {
+      if (seal_state == SEAL_SLOW_SPEED) {
+        pwm.setPWM(STATION_SEAL_MOTOR, 0, map(analogRead(STATION_SEAL_SPEED), 0, 1023, map(10, 0, 100, MOTOR_0, MOTOR_100), map(25, 0, 100, MOTOR_0, MOTOR_100)));
+        seal_state = SEAL_TURN_2;
+      } else if (seal_state == SEAL_DONE) {
         pwm.setPWM(STATION_SEAL_MOTOR, 0, MOTOR_0);
         seal_state = SEAL_OFF;
       }
       
       delay(1);
     }
+    
+    // Reset all pwms (in case error happened)
+    pwm.setPWM(STATION_CUT_MOTOR, 0, MOTOR_0);
+    pwm.setPWM(STATION_FILL_SERVO, 0, STATION_FILL_UP);
+    pwm.setPWM(STATION_SEAL_MOTOR, 0, MOTOR_0);
+    cut_state = CUT_OFF; fill_state = FILL_OFF; seal_state = SEAL_OFF;
   }
   
   // Handle knobbed pause
-  delay(500 + map(analogRead(BELT_WAIT), 0, 1023, 0, 5000));
+  delay(map(analogRead(BELT_WAIT), 0, 1023, 0, 5000));
 }
 
 volatile unsigned count = 0;
@@ -322,7 +383,7 @@ void timerint()
   if (global_state == MOVE_BELT || global_state == INIT) {
     if(fabs((double)analogRead(BELT_ENCODER) - next_beltpos) > 10.0) {
       digitalWrite(BELT_STEP, digitalRead(BELT_STEP) ^ 1);
-    } else {
+    } else if (global_state == MOVE_BELT) {
       // Next step
       global_state = STATIONS;
     }
@@ -340,8 +401,11 @@ void timerint()
     }
     
     // Check fill station
-    if (fill_state == FILL_MOVE_1) {
-      if (fill_state == FILL_MOVE_1 && digitalRead(STATION_FILL_SWITCH) == 0) {
+    if (fill_state == FILL_PUMP) {
+      if (fill_stepsleft > 0) {
+        digitalWrite(STATION_FILL_STEP, digitalRead(STATION_FILL_STEP) ^ 1);
+        fill_stepsleft -= 1;
+      } else {
         fill_state = FILL_DONE;
       }
     }
@@ -350,7 +414,7 @@ void timerint()
     if (seal_state == SEAL_TURN_1 || seal_state == SEAL_TURN_2) {
       unsigned hall = digitalRead(STATION_SEAL_HALL);
       if (seal_state == SEAL_TURN_1 && hall == 1) {
-        seal_state = SEAL_TURN_2;
+        seal_state = SEAL_SLOW_SPEED;
       } else if (seal_state == SEAL_TURN_2 && hall == 0) {
         seal_state = SEAL_DONE;
       }
