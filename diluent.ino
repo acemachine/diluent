@@ -67,7 +67,7 @@ volatile unsigned seal_temperature = 0;
 #define STATION_FILL_DOWN       220
 #define STATION_FILL_STEP       3
 #define STATION_FILL_DIRECTION  6
-#define STATION_FILL_STEPS      3000
+#define STATION_FILL_STEPS      4100
 
 volatile enum {
   FILL_RESET,
