@@ -64,10 +64,11 @@ volatile unsigned seal_temperature = 0;
 #define STATION_FILL_SWITCH     27
 #define STATION_FILL_UP         275
 #define STATION_FILL_CHECK      245
-#define STATION_FILL_DOWN       220
+#define STATION_FILL_DOWN       216
 #define STATION_FILL_STEP       3
 #define STATION_FILL_DIRECTION  6
 #define STATION_FILL_STEPS      4100
+#define STATION_FILL_SENSOR     A14
 
 volatile enum {
   FILL_RESET,
@@ -247,13 +248,14 @@ void loop()
 
 handle_pause:
 
+  global_state = WAIT;
+
   // Handle pause
   while (debounceRead(GREEN_TOGGLE) == 1) {
     LED_OFF(LED_1G); LED_ON(LED_3G);
     delay(100);
   }
   LED_OFF(LED_3G);
-  global_state = WAIT;
   
   // Handle heater
   LED_OFF(LED_1G);
@@ -299,12 +301,13 @@ handle_pause:
     unsigned fill_start = millis();
     unsigned fill_tries = 0;
     unsigned fill_servopos = 0;
+    signed fill_sensorval = 0;
     pwm.setPWM(STATION_FILL_SERVO, 0, STATION_FILL_CHECK);
     fill_state = FILL_CHECK_1;
     
     // Seal station
-   //no seal// pwm.setPWM(STATION_SEAL_MOTOR, 0, MOTOR_100);
-    //no seal// seal_state = SEAL_TURN_1;
+   pwm.setPWM(STATION_SEAL_MOTOR, 0, MOTOR_100);
+   seal_state = SEAL_TURN_1;
     
     // Wait for state change
     while (!IS_ERROR() && (cut_state != CUT_OFF || fill_state != FILL_OFF || seal_state != SEAL_OFF)) {
@@ -315,11 +318,12 @@ handle_pause:
       
       unsigned now = millis();
       #define FILL_TIME()            (now - fill_start)
+      #define FILL_SENSE()           (fill_sensorval = (fill_sensorval *20 + abs(513 - analogRead(STATION_FILL_SENSOR)))/21)
       #define FILL_TRANS(state) { fill_start = millis(); fill_state = state; }
       if (fill_state == FILL_RESET && FILL_TIME() > 500) {
         
         // 3 strikes and you're out
-        if (fill_tries >= 3) {
+        if (fill_tries >= 2) {
           global_state = FILL_ERROR;
           LED_ERROR(LED_5R);
           break;
@@ -330,27 +334,41 @@ handle_pause:
         
       } else if (fill_state == FILL_CHECK_1 && FILL_TIME() > 500) {
         
-        if (digitalRead(STATION_FILL_SWITCH) == 0) {
-          // Fill switch contacted something, bad
-          fill_tries += 1;
-          pwm.setPWM(STATION_FILL_SERVO, 0, STATION_FILL_UP);
-          FILL_TRANS(FILL_RESET);
-        } else {
-          // Fill switch good
-          pwm.setPWM(STATION_FILL_SERVO, 0, STATION_FILL_DOWN);
-          FILL_TRANS(FILL_CHECK_2);
-        }
+        //pwm.setPWM(STATION_FILL_SERVO, 0, STATION_FILL_DOWN);
+        fill_servopos = STATION_FILL_CHECK;
+        FILL_TRANS(FILL_CHECK_2);
         
-      } else if (fill_state == FILL_CHECK_2 && FILL_TIME() > 500) {
+        delay(100); FILL_SENSE();
+        delay(100); FILL_SENSE();
+        delay(100); FILL_SENSE();
+        delay(100); FILL_SENSE();
+        delay(100); FILL_SENSE();
+        delay(100); FILL_SENSE();
         
-        if (digitalRead(STATION_FILL_SWITCH) == 1) {
-          // Fill switch contacted nothing, empty
-          FILL_TRANS(FILL_DONE);
-        } else {
-          // Fill switch engaged
-          fill_servopos = STATION_FILL_DOWN;
-          fill_stepsleft = STATION_FILL_STEPS;
-          FILL_TRANS(FILL_PUMP);
+      } else if (fill_state == FILL_CHECK_2) {
+        
+        if (fill_servopos > STATION_FILL_DOWN) {
+          if (FILL_SENSE() > 7 && fill_servopos > 230) {
+            // Fill switch contacted something, bad
+            fill_tries += 1;
+            pwm.setPWM(STATION_FILL_SERVO, 0, STATION_FILL_UP);
+            FILL_TRANS(FILL_RESET);
+          } else {
+            fill_servopos -= 1;
+            pwm.setPWM(STATION_FILL_SERVO, 0, fill_servopos);
+            delay(17);
+          }
+        
+        } else {   
+          if (digitalRead(STATION_FILL_SWITCH) == 1) {
+            // Fill switch contacted nothing, empty
+            FILL_TRANS(FILL_DONE);
+          } else {
+            // Fill switch engaged
+            fill_servopos = STATION_FILL_DOWN;
+            fill_stepsleft = STATION_FILL_STEPS;
+            FILL_TRANS(FILL_PUMP);
+          }
         }
       } else if (fill_state == FILL_SLOW_UP) {
         
@@ -360,14 +378,15 @@ handle_pause:
           delay(17);
           
         } else {
-          fill_state = FILL_OFF;
+          FILL_TRANS(FILL_OFF);
         }
         
       } else if (fill_state == FILL_DONE) {
         pwm.setPWM(STATION_FILL_SERVO, 0, STATION_FILL_UP);
         fill_state = FILL_OFF;
+        
       }
-      /* //seal off//
+      
       if (seal_state == SEAL_SLOW_SPEED) {
         pwm.setPWM(STATION_SEAL_MOTOR, 0, map(analogRead(STATION_SEAL_SPEED), 0, 1023, map(10, 0, 100, MOTOR_0, MOTOR_100), map(25, 0, 100, MOTOR_0, MOTOR_100)));
         seal_state = SEAL_TURN_2;
@@ -375,7 +394,7 @@ handle_pause:
         pwm.setPWM(STATION_SEAL_MOTOR, 0, MOTOR_0);
         seal_state = SEAL_OFF;
       }
-      */ //seal off//
+      
       delay(1);
     }
     
@@ -402,7 +421,11 @@ void timerint()
     }
   }
   
-  if (global_state == STATIONS) {
+  if (global_state == WAIT && digitalRead(GREEN_TOGGLE) == 1 && analogRead(KNOB1) > 512) {
+    digitalWrite(STATION_FILL_STEP, digitalRead(STATION_FILL_STEP) ^ 1);
+  }
+  
+  /*if (global_state == STATIONS)*/ {
     // Check cutter station
     if (cut_state == CUT_TURN_1 || cut_state == CUT_TURN_2) {
       unsigned hall = digitalRead(STATION_CUT_HALL);
@@ -424,14 +447,14 @@ void timerint()
     }
     
     // Check seal station
-   /*seal off// if (seal_state == SEAL_TURN_1 || seal_state == SEAL_TURN_2) {
+   if (seal_state == SEAL_TURN_1 || seal_state == SEAL_TURN_2) {
       unsigned hall = digitalRead(STATION_SEAL_HALL);
       if (seal_state == SEAL_TURN_1 && hall == 1) {
         seal_state = SEAL_SLOW_SPEED;
       } else if (seal_state == SEAL_TURN_2 && hall == 0) {
         seal_state = SEAL_DONE;
       }
-    } */ //seal off//
+    } 
   }
   
   if ((count % 1000) == 0) {
